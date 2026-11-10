@@ -1,0 +1,2 @@
+# BeterFront
+Strategic Game.
