@@ -20,7 +20,7 @@ class Menu:
     def __init__(self):
         pygame.init()
 
-        pygame.display.set_caption("OpenFront")
+        pygame.display.set_caption("Beterfront")
         # Keep a fixed 1100x700 design canvas and stretch it (nearest-neighbor)
         # to the actual window size. This resizes buttons/UI cleanly without
         # blur. Fullscreen uses borderless windowed mode at desktop resolution
@@ -54,9 +54,10 @@ class Menu:
 
         self.difficulty = "Medium"
         self.bots = 100
+        self.tribes = 25       # 0 .. 50 weak NPC tribes
+        self.game_speed = 1.0  # 0.5x .. 3.0x
 
         self.options = {
-            "Disable NPCs (nations)": False,
             "Instant build": False,
             "Infinite gold": False,
             "Infinite troops": False,
@@ -69,10 +70,11 @@ class Menu:
         self.fps_limit = 60
         self.theme = "dark"
 
-        self.dragging = False
+        self.dragging = None  # "bots" | "tribes" | "speed" | None
         self.settings_dragging = None
 
         self.apply_theme()
+        self.load_saved_settings()
 
     # -------------------------------------------------
     # COORDINATE MAPPING (full stretch)
@@ -488,7 +490,7 @@ class Menu:
     def screen_main(self, mouse, clicks):
 
         self.draw_text(
-            "OPENFRONT",
+            "BETERFRONT",
             self.f_title,
             WHITE,
             (W // 2, 170 + int(math.sin(self.time * 1.6) * 5)),
@@ -800,19 +802,19 @@ class Menu:
         self.section_title(
             "BOT COUNT",
             settings.x + 22,
-            settings.y + 155
+            settings.y + 140
         )
 
         self.draw_text(
             f"{self.bots} / 400",
             self.f_med,
             BLUE_LIGHT,
-            (settings.right - 100, settings.y + 153)
+            (settings.right - 100, settings.y + 138)
         )
 
         slider = pygame.Rect(
             settings.x + 22,
-            settings.y + 205,
+            settings.y + 172,
             settings.w - 44,
             8
         )
@@ -850,27 +852,161 @@ class Menu:
             "0",
             self.f_small,
             MUTED,
-            (slider.x, slider.y + 17)
+            (slider.x, slider.y + 12)
         )
 
         self.draw_text(
             "400",
             self.f_small,
             MUTED,
-            (slider.right - 28, slider.y + 17)
+            (slider.right - 28, slider.y + 12)
+        )
+
+        # ---- TRIBE COUNT ----
+        self.section_title(
+            "TRIBE COUNT",
+            settings.x + 22,
+            settings.y + 200
+        )
+
+        self.draw_text(
+            f"{self.tribes} / 50",
+            self.f_med,
+            BLUE_LIGHT,
+            (settings.right - 90, settings.y + 198)
+        )
+
+        tribe_slider = pygame.Rect(
+            settings.x + 22,
+            settings.y + 232,
+            settings.w - 44,
+            8
+        )
+
+        self.rounded(self.screen, PANEL_LIGHT, tribe_slider, 5)
+
+        tribe_frac = self.animated_value("tribe_slider", self.tribes / 50.0, 10)
+
+        tribe_fill = pygame.Rect(
+            tribe_slider.x,
+            tribe_slider.y,
+            int(tribe_slider.w * tribe_frac),
+            tribe_slider.h
+        )
+
+        self.rounded(self.screen, BLUE, tribe_fill, 5)
+
+        tribe_knob_x = int(tribe_slider.x + tribe_slider.w * tribe_frac)
+
+        pygame.draw.circle(
+            self.screen,
+            WHITE,
+            (tribe_knob_x, tribe_slider.centery),
+            11
+        )
+
+        pygame.draw.circle(
+            self.screen,
+            BLUE,
+            (tribe_knob_x, tribe_slider.centery),
+            5
+        )
+
+        self.draw_text(
+            "0",
+            self.f_small,
+            MUTED,
+            (tribe_slider.x, tribe_slider.y + 12)
+        )
+
+        self.draw_text(
+            "50",
+            self.f_small,
+            MUTED,
+            (tribe_slider.right - 20, tribe_slider.y + 12)
+        )
+
+        # ---- GAME SPEED ----
+        self.section_title(
+            "GAME SPEED",
+            settings.x + 22,
+            settings.y + 260
+        )
+
+        speed_label = f"{self.game_speed:.1f}x"
+        self.draw_text(
+            speed_label,
+            self.f_med,
+            BLUE_LIGHT,
+            (settings.right - 70, settings.y + 258)
+        )
+
+        speed_slider = pygame.Rect(
+            settings.x + 22,
+            settings.y + 292,
+            settings.w - 44,
+            8
+        )
+
+        self.rounded(self.screen, PANEL_LIGHT, speed_slider, 5)
+
+        # Map 0.5 .. 3.0 → 0 .. 1
+        speed_frac = self.animated_value(
+            "speed_slider",
+            (self.game_speed - 0.5) / 2.5,
+            10
+        )
+
+        speed_fill = pygame.Rect(
+            speed_slider.x,
+            speed_slider.y,
+            int(speed_slider.w * speed_frac),
+            speed_slider.h
+        )
+
+        self.rounded(self.screen, BLUE, speed_fill, 5)
+
+        speed_knob_x = int(speed_slider.x + speed_slider.w * speed_frac)
+
+        pygame.draw.circle(
+            self.screen,
+            WHITE,
+            (speed_knob_x, speed_slider.centery),
+            11
+        )
+
+        pygame.draw.circle(
+            self.screen,
+            BLUE,
+            (speed_knob_x, speed_slider.centery),
+            5
+        )
+
+        self.draw_text(
+            "0.5x",
+            self.f_small,
+            MUTED,
+            (speed_slider.x, speed_slider.y + 12)
+        )
+
+        self.draw_text(
+            "3.0x",
+            self.f_small,
+            MUTED,
+            (speed_slider.right - 30, speed_slider.y + 12)
         )
 
         self.section_title(
             "GAME MODIFIERS",
             settings.x + 22,
-            settings.y + 258
+            settings.y + 322
         )
 
         toggle_rects = []
 
         for i, name in enumerate(self.options):
 
-            y = settings.y + 300 + i * 34
+            y = settings.y + 352 + i * 28
 
             self.draw_text(
                 name,
@@ -918,13 +1054,28 @@ class Menu:
                 center=True
             )
 
-        if mouse_down and self.dragging:
+        if mouse_down and self.dragging == "bots":
 
             f = (mouse[0] - slider.x) / slider.w
 
             self.bots = int(
                 round(max(0, min(1, f)) * 400 / 5) * 5
             )
+
+        if mouse_down and self.dragging == "tribes":
+
+            f = (mouse[0] - tribe_slider.x) / tribe_slider.w
+
+            self.tribes = int(
+                round(max(0, min(1, f)) * 50)
+            )
+
+        if mouse_down and self.dragging == "speed":
+
+            f = (mouse[0] - speed_slider.x) / speed_slider.w
+            f = max(0.0, min(1.0, f))
+            # Snap to 0.1 steps between 0.5 and 3.0
+            self.game_speed = round(0.5 + f * 2.5, 1)
 
         for click in clicks:
 
@@ -952,13 +1103,44 @@ class Menu:
 
             if slider_hitbox.collidepoint(click):
 
-                self.dragging = True
+                self.dragging = "bots"
 
                 f = (click[0] - slider.x) / slider.w
 
                 self.bots = int(
                     round(max(0, min(1, f)) * 400 / 5) * 5
                 )
+
+            tribe_hitbox = pygame.Rect(
+                tribe_slider.x - 12,
+                tribe_slider.y - 14,
+                tribe_slider.w + 24,
+                tribe_slider.h + 28
+            )
+
+            if tribe_hitbox.collidepoint(click):
+
+                self.dragging = "tribes"
+
+                f = (click[0] - tribe_slider.x) / tribe_slider.w
+
+                self.tribes = int(
+                    round(max(0, min(1, f)) * 50)
+                )
+
+            speed_hitbox = pygame.Rect(
+                speed_slider.x - 12,
+                speed_slider.y - 14,
+                speed_slider.w + 24,
+                speed_slider.h + 28
+            )
+
+            if speed_hitbox.collidepoint(click):
+
+                self.dragging = "speed"
+
+                f = max(0.0, min(1.0, (click[0] - speed_slider.x) / speed_slider.w))
+                self.game_speed = round(0.5 + f * 2.5, 1)
 
             if start.collidepoint(click):
 
@@ -1405,6 +1587,54 @@ class Menu:
     # SETTINGS DATA
     # -------------------------------------------------
 
+    def load_saved_settings(self):
+        """Restore last-used play settings from settings.json if present."""
+        if not os.path.isfile(SETTINGS_FILE):
+            return
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+        if data.get("difficulty") in DIFFICULTIES:
+            self.difficulty = data["difficulty"]
+        try:
+            self.bots = max(0, min(400, int(data.get("bots", self.bots))))
+        except (TypeError, ValueError):
+            pass
+        try:
+            # Prefer explicit tribes count; fall back to disable_npcs legacy flag
+            if "tribes" in data:
+                self.tribes = max(0, min(50, int(data["tribes"])))
+            elif data.get("disable_npcs"):
+                self.tribes = 0
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.game_speed = max(0.5, min(3.0, float(data.get("game_speed", 1.0))))
+        except (TypeError, ValueError):
+            pass
+        if "instant_build" in data:
+            self.options["Instant build"] = bool(data["instant_build"])
+        if "infinite_gold" in data:
+            self.options["Infinite gold"] = bool(data["infinite_gold"])
+        if "infinite_troops" in data:
+            self.options["Infinite troops"] = bool(data["infinite_troops"])
+        if data.get("username"):
+            self.username = str(data["username"])
+        if data.get("player_tag"):
+            self.player_tag = str(data["player_tag"])
+        try:
+            self.music_volume = max(0, min(100, int(data.get("music_volume", self.music_volume))))
+            self.sfx_volume = max(0, min(100, int(data.get("sfx_volume", self.sfx_volume))))
+            self.fps_limit = max(15, min(240, int(data.get("fps_limit", self.fps_limit))))
+        except (TypeError, ValueError):
+            pass
+        if data.get("theme") in ("dark", "light"):
+            self.theme = data["theme"]
+            self.apply_theme()
+        self.fullscreen = bool(data.get("fullscreen", self.fullscreen))
+
     def collect_settings(self):
 
         return {
@@ -1421,9 +1651,10 @@ class Menu:
 
             "difficulty": self.difficulty,
             "bots": self.bots,
+            "tribes": self.tribes,
+            "game_speed": round(self.game_speed, 2),
 
-            "disable_npcs":
-                self.options["Disable NPCs (nations)"],
+            "disable_npcs": self.tribes <= 0,
 
             "instant_build":
                 self.options["Instant build"],
@@ -1510,7 +1741,7 @@ class Menu:
                     and event.button == 1
                 ):
 
-                    self.dragging = False
+                    self.dragging = None
                     self.settings_dragging = None
 
                 elif event.type == pygame.KEYDOWN:
@@ -1520,7 +1751,7 @@ class Menu:
                         if self.state != "main":
 
                             self.state = "main"
-                            self.dragging = False
+                            self.dragging = None
                             self.settings_dragging = None
                             self.editing_field = None
 
