@@ -1,5 +1,5 @@
 """
-OpenFront World - an OpenFront-style territory war game on a detailed world map.
+Beterfront - an OpenFront-style territory war game on a detailed world map.
 
 Controls
   Left-click land ........ attack it (land you border)
@@ -29,8 +29,9 @@ Features
   - Warships: steal non-allied cargo ships, sink invasion boats, fight enemy warships
   - Nukes can target the sea and destroy ships
   - Fighter jets (3M) capture planes from non-allied nations mid-air
-  - 10 weak tribes that only expand; eliminate anyone to loot 70% of their gold
+  - Weak tribes that only expand; eliminate anyone to loot 70% of their gold
   - Alliances (+25% trade between allies) and betrayal (traitor: -50% defense for 2 min)
+  - Menu-driven settings: difficulty, bot count, game speed, and modifiers
 """
 import subprocess
 import sys
@@ -44,6 +45,7 @@ except ImportError:
 
 import base64
 import gc
+import json
 import os
 import heapq
 import math
@@ -57,13 +59,88 @@ GW, GH = 1600, 622          # map size in tiles (real Earth, 80N to 60S)
 TS = 5                      # world pixels per tile
 WORLD_W, WORLD_H = GW * TS, GH * TS
 MAP_W, MAP_H = 1200, 600    # on-screen map view
-PANEL_H = 110
-WIN_W, WIN_H = MAP_W, MAP_H + PANEL_H
+PANEL_H = 0                  # no reserved strip — HUD floats over the map
+WIN_W, WIN_H = MAP_W, MAP_H  # full window is the map
 FPS = 60
 TICK = 0.1                  # game logic step (seconds)
 NUM_BOTS = 5
 WIN_SHARE = 0.80            # own this share of the land to win
 BOT_BOOST = 0.9             # bot troop growth multiplier (difficulty)
+GAME_SPEED = 1.0            # logic & realtime speed multiplier (from menu)
+PLAYER_NAME = "You"
+DISABLE_NPCS = False
+INSTANT_BUILD = False
+INFINITE_GOLD = False
+INFINITE_TROOPS = False
+
+DIFFICULTY_BOOST = {
+    "Easy": 0.55,
+    "Medium": 0.90,
+    "Hard": 1.35,
+    "Impossible": 1.90,
+}
+
+
+def load_settings():
+    """Load menu settings from --settings JSON arg or settings.json next to this file."""
+    global FPS, NUM_BOTS, BOT_BOOST, GAME_SPEED, PLAYER_NAME
+    global NUM_TRIBES, DISABLE_NPCS, INSTANT_BUILD, INFINITE_GOLD, INFINITE_TROOPS
+
+    data = {}
+    argv = sys.argv[1:]
+    if "--settings" in argv:
+        i = argv.index("--settings")
+        if i + 1 < len(argv):
+            try:
+                data = json.loads(argv[i + 1])
+            except Exception as exc:
+                print("Could not parse --settings JSON:", exc)
+    if not data:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as exc:
+                print("Could not read settings.json:", exc)
+
+    if not data:
+        return
+
+    difficulty = str(data.get("difficulty", "Medium"))
+    BOT_BOOST = DIFFICULTY_BOOST.get(difficulty, 0.90)
+
+    try:
+        NUM_BOTS = max(0, min(400, int(data.get("bots", NUM_BOTS))))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        if "tribes" in data:
+            NUM_TRIBES = max(0, min(50, int(data["tribes"])))
+        elif data.get("disable_npcs"):
+            NUM_TRIBES = 0
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        GAME_SPEED = max(0.25, min(4.0, float(data.get("game_speed", 1.0))))
+    except (TypeError, ValueError):
+        GAME_SPEED = 1.0
+
+    try:
+        FPS = max(15, min(240, int(data.get("fps_limit", FPS))))
+    except (TypeError, ValueError):
+        pass
+
+    name = (data.get("display_name") or data.get("username") or "You").strip()
+    PLAYER_NAME = name or "You"
+
+    DISABLE_NPCS = NUM_TRIBES <= 0
+
+    INSTANT_BUILD = bool(data.get("instant_build", False))
+    INFINITE_GOLD = bool(data.get("infinite_gold", False))
+    INFINITE_TROOPS = bool(data.get("infinite_troops", False))
 
 COST = {"city": 125_000, "defense": 50_000, "silo": 300_000, "airdef": 500_000, "port": 210_000,
         "station": 100_000, "airport": 10_000, "warship": 150_000, "jet": 3_000_000,
@@ -75,7 +152,7 @@ MODES = ["city", "defense", "silo", "airdef", "port", "station", "airport", "war
 MODE_KEYS = "1234567890N"
 BUILDINGS = ["city", "defense", "silo", "airdef", "port", "station", "airport"]
 RAIL_KINDS = ("station", "city", "port", "airport")
-BUILD_GAP = 27              # min distance between buildings (tiles)
+BUILD_GAP = 14              # min distance between buildings (tiles)
 
 # economy
 TROOPS_PER_TILE = 0.46
@@ -95,8 +172,8 @@ AD_UPGRADE_COST = 100_000   # x current level
 AD_COOLDOWN = 2.5
 AD_HIT_CHANCE = 0.75
 
-BOAT_SPEED = 46             # tiles per second (transport boats)
-TRADE_SPEED = 33            # tiles per second (cargo ships)
+BOAT_SPEED = 32             # tiles per second (transport boats) — slower
+TRADE_SPEED = 23            # tiles per second (cargo ships) — slower
 MAX_BOATS = 3
 TRADE_INTERVAL = 20.0      # seconds between cargo ships per port
 
@@ -107,7 +184,7 @@ TRAIN_SPEED = 91              # 25% slower oil tankers
 MAX_TRAINS = 12
 
 PLANE_INTERVAL = 90.0       # seconds between flights per airport
-PLANE_SPEED = 133           # tiles per second
+PLANE_SPEED = 90            # tiles per second — slower
 PLANE_REWARD = 125_000      # gold when a plane lands from another nation
 TRAIN_REWARD = 50_000       # gold per train arrival (both nations on a cross-border trip)
 PORT_REWARD = 80_000        # gold per cargo ship arrival (both nations)
@@ -126,12 +203,28 @@ UPGRADE_INFO = {
     "airport": "planes 25% more often",
 }
 
-WARSHIP_SPEED = 54          # tiles per second
-WARSHIP_RANGE = 100         # how far a warship can see (tiles)
-WARSHIP_PATROL = 116        # patrol radius around its home port
-WARSHIP_LEASH = 231         # gives up a chase this far from home
-WARSHIP_HP = 100
+MODE_DESC = {
+    "city": "Increases max population",
+    "defense": "Fortifies nearby land",
+    "silo": "Launches nuclear missiles",
+    "airdef": "Shoots down enemy planes & nukes",
+    "port": "Builds ships and trades by sea",
+    "station": "Links railways for train trade",
+    "airport": "Sends planes for air trade",
+    "warship": "Patrols seas, sinks boats & ships",
+    "jet": "Hunts and captures enemy planes",
+    "upgrade": "Upgrade a building you own",
+    "nuke": "Strike a target with a missile",
+}
+
+WARSHIP_SPEED = 28          # tiles per second (further slowed)
+WARSHIP_RANGE = 70          # how far a warship can see (tiles)
+WARSHIP_PATROL = 81         # patrol radius around its home port
+WARSHIP_LEASH = 162         # gives up a chase this far from home
+WARSHIP_HP = 70
 WARSHIPS_PER_PORT = 3
+WARSHIP_DMG_SHIP = 10.5     # DPS vs enemy warships (was 15)
+WARSHIP_DMG_BOAT = 21.0     # DPS vs boats (was 30)
 
 JET_SPEED = 289             # tiles per second (planes fly 69)
 JET_RANGE = 212             # how far a jet can spot planes (tiles)
@@ -144,8 +237,11 @@ TRIBE_BOOST = 0.5           # tribes grow troops at half speed
 LOOT_SHARE = 0.70           # share of gold taken when you eliminate someone
 TRIBE_NAMES = [n + " Tribe" for n in (
     "Orra", "Kesh", "Tamu", "Vala", "Nori", "Ishka", "Rumo", "Belu", "Sarn", "Okko", "Dara", "Feni", "Golo",
-    "Hesk", "Ivo", "Jarn", "Kuro", "Lema", "Mosi", "Nabu", "Opa", "Pesh", "Quro", "Rani", "Sefu")]
-TRIBE_COLORS = [(110 + (i * 37) % 70, 95 + (i * 23) % 55, 70 + (i * 41) % 50) for i in range(NUM_TRIBES)]
+    "Hesk", "Ivo", "Jarn", "Kuro", "Lema", "Mosi", "Nabu", "Opa", "Pesh", "Quro", "Rani", "Sefu",
+    "Tova", "Ulan", "Vesh", "Woru", "Xena", "Yaro", "Zeli", "Arun", "Brax", "Cori", "Dune", "Elka",
+    "Faro", "Grix", "Hala", "Inra", "Julo", "Kova", "Lira", "Meka", "Noxa", "Orin", "Pyla", "Qest",
+    "Riva", "Sylo")]
+TRIBE_COLORS = [(110 + (i * 37) % 70, 95 + (i * 23) % 55, 70 + (i * 41) % 50) for i in range(50)]
 
 TRAITOR_TIME = 120.0        # seconds a betrayer is marked as traitor
 ALLY_TRADE_BONUS = 1.25     # +25% trade income between allies
@@ -154,11 +250,21 @@ WATER = (38, 84, 145)
 WATER_DEEP = (18, 44, 90)
 COAST = (64, 122, 180)
 LAKE = (60, 110, 170)
-BOT_NAMES = ["Red Baron", "Atlantis", "Nordheim", "Sultanate", "Kraken", "Iron Union", "Zephyria"]
+BOT_NAMES = [
+    "Red Baron", "Atlantis", "Nordheim", "Sultanate", "Kraken", "Iron Union", "Zephyria",
+    "Solara", "Vanguard", "Obsidian", "Aurora", "Titan", "Horizon", "Eclipse", "Storm",
+    "Ember", "Cascade", "Vortex", "Aegis", "Nova", "Falcon", "Summit", "Mirage", "Corsair",
+    "Phoenix", "Warden", "Spectre", "Rift", "Glacier", "Pulse", "Cipher", "Forge",
+]
 PLAYER_COLORS = [(60, 140, 255), (225, 60, 60), (250, 180, 30), (150, 70, 190),
-                 (20, 180, 170), (120, 200, 70), (255, 120, 60)]
+                 (20, 180, 170), (120, 200, 70), (255, 120, 60), (200, 90, 160),
+                 (90, 200, 255), (255, 160, 90), (80, 220, 140), (180, 120, 255),
+                 (255, 90, 120), (140, 160, 80), (70, 110, 220), (230, 200, 60)]
 NB4 = ((1, 0), (-1, 0), (0, 1), (0, -1))
 NB8 = NB4 + ((1, 1), (1, -1), (-1, 1), (-1, -1))
+
+# Apply menu settings after defaults are defined
+load_settings()
 
 # 1600x622 world land mask (80N .. 60S, matches the satellite image), zlib + base64 packed bits
 WORLD_MASK = (
@@ -368,9 +474,26 @@ DESERTS = [(14, 33, -17, 60), (23, 38, 50, 75), (36, 48, 75, 115), (-32, -18, 11
 
 def fmt(n):
     n = int(n)
+    neg = n < 0
+    n = abs(n)
     if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+        s = f"{n / 1_000_000:.2f}M"
+    elif n >= 1000:
+        s = f"{n / 1000:.2f}K"
+        if s.endswith("0K"):
+            s = s[:-2] + "K"
+        if s.endswith(".K"):
+            s = s[:-2] + "K"
+    else:
+        s = str(n)
+    return ("-" if neg else "") + s
+
+
+def fmt_rate(n):
+    """Format a per-second rate like +389/s."""
+    n = int(round(n))
+    sign = "+" if n >= 0 else ""
+    return f"{sign}{fmt(n)}/s"
 
 
 def lerp_color(a, b, t):
@@ -441,18 +564,24 @@ def value_noise(cell):
 
 
 def biome(lat, lon):
-    if abs(lat) > 70:
-        return "ice", (226, 230, 234)
-    if abs(lat) > 62:
-        return "tundra", (170, 180, 162)
+    if abs(lat) > 72:
+        return "ice", (232, 236, 240)
+    if abs(lat) > 64:
+        return "tundra", (168, 178, 160)
     for la0, la1, lo0, lo1 in DESERTS:
         if la0 <= lat <= la1 and lo0 <= lon <= lo1:
             return "desert", (214, 192, 132)
-    if abs(lat) < 12:
-        return "jungle", (62, 128, 60)
-    if abs(lat) > 50:
-        return "taiga", (92, 132, 86)
-    return "plains", (128, 170, 92)
+    if abs(lat) < 8:
+        return "jungle", (48, 118, 52)
+    if abs(lat) < 16:
+        return "tropical", (72, 138, 62)
+    if abs(lat) > 52:
+        return "taiga", (86, 128, 80)
+    if abs(lat) > 42:
+        return "temperate", (108, 152, 88)
+    if 15 < abs(lat) < 28:
+        return "savanna", (158, 168, 92)
+    return "plains", (122, 164, 86)
 
 
 def mountain_map(land):
@@ -501,12 +630,37 @@ def flood_sizes(grid_ok, nbrs):
 
 
 def terrain_colors(land, elev, coast):
-    """Generated terrain colors - only used if the satellite image is missing."""
+    """Richer generated terrain: biomes, forests, snow peaks, beaches, rivers, shading."""
     n1, n2, n3 = value_noise(40), value_noise(14), value_noise(7)
+    n4, n5 = value_noise(5), value_noise(3)          # fine detail
     j1, j2 = value_noise(24), value_noise(24)
-    height = [[(elev[y][x] + 0.18 * n1[y][x] + 0.07 * n3[y][x]) if land[y][x] else 0.0 for x in range(GW)]
-              for y in range(GH)]
+    forest = value_noise(9)
+    height = [[(elev[y][x] + 0.18 * n1[y][x] + 0.07 * n3[y][x] + 0.04 * n4[y][x])
+               if land[y][x] else 0.0 for x in range(GW)] for y in range(GH)]
     colors = [[(0, 0, 0)] * GW for _ in range(GH)]
+
+    # Precompute a simple river mask: high-elevation noise ridges flowing toward low/coast
+    river = [[False] * GW for _ in range(GH)]
+    for y in range(GH):
+        for x in range(GW):
+            if not land[y][x]:
+                continue
+            e = elev[y][x]
+            # thin winding channels where fine noise is near a threshold and elev is mid
+            if 0.12 < e < 0.55 and 0.46 < n5[y][x] < 0.52 and n4[y][x] > 0.35:
+                # prefer downhill paths: only mark if a neighbour is lower
+                lower = False
+                for dx, dy in NB4:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < GW and 0 <= ny < GH and land[ny][nx] and elev[ny][nx] < e - 0.02:
+                        lower = True
+                        break
+                    if 0 <= nx < GW and 0 <= ny < GH and not land[ny][nx]:
+                        lower = True
+                        break
+                if lower:
+                    river[y][x] = True
+
     for y in range(GH):
         for x in range(GW):
             if not land[y][x]:
@@ -515,22 +669,72 @@ def terrain_colors(land, elev, coast):
             kind, base = biome(lat + (j1[y][x] - 0.5) * 12 + (n3[y][x] - 0.5) * 4,
                                lon + (j2[y][x] - 0.5) * 16)
             e = elev[y][x]
-            if e > 0.72:
-                col = lerp_color((150, 138, 122), (242, 244, 248), (e - 0.72) / 0.18)
-            elif e > 0.45:
-                col = lerp_color(base, (142, 128, 110), (e - 0.45) / 0.27)
-            elif e > 0.2:
-                col = lerp_color(base, (122, 116, 90), 0.3 * (e - 0.2) / 0.25)
+            detail = (n4[y][x] - 0.5) * 18
+
+            # elevation bands
+            if e > 0.78:
+                # snow / ice peaks
+                col = lerp_color((200, 205, 210), (248, 250, 252), min(1.0, (e - 0.78) / 0.22))
+            elif e > 0.58:
+                # rocky highlands
+                rock = (132 + int(detail), 122 + int(detail * 0.7), 108 + int(detail * 0.5))
+                rock = tuple(max(40, min(255, c)) for c in rock)
+                col = lerp_color(base, rock, (e - 0.58) / 0.20)
+            elif e > 0.32:
+                # hills
+                hill = (118 + int(detail * 0.6), 112 + int(detail * 0.5), 88 + int(detail * 0.4))
+                hill = tuple(max(40, min(255, c)) for c in hill)
+                col = lerp_color(base, hill, 0.35 * (e - 0.32) / 0.26)
             else:
                 col = base
-            if coast[y][x] and abs(lat) < 55 and e < 0.4:
-                col = lerp_color(col, (222, 206, 156), 0.5)
+
+            # forest / vegetation mottling (not on desert/ice/high peaks)
+            if kind not in ("desert", "ice") and e < 0.55:
+                f = forest[y][x]
+                if kind in ("jungle", "tropical") and f > 0.35:
+                    dark = (max(20, col[0] - 28), max(30, col[1] - 8), max(20, col[2] - 22))
+                    col = lerp_color(col, dark, 0.35 + 0.35 * (f - 0.35))
+                elif kind in ("taiga", "temperate") and f > 0.55:
+                    dark = (max(20, col[0] - 22), max(30, col[1] - 6), max(20, col[2] - 18))
+                    col = lerp_color(col, dark, 0.25 + 0.3 * (f - 0.55))
+                elif kind == "plains" and f > 0.62:
+                    dark = (max(20, col[0] - 16), max(30, col[1] - 4), max(20, col[2] - 12))
+                    col = lerp_color(col, dark, 0.2)
+
+            # desert dune variation
+            if kind == "desert":
+                dvar = (n3[y][x] - 0.5) * 22
+                col = (max(140, min(240, col[0] + int(dvar))),
+                       max(120, min(220, col[1] + int(dvar * 0.8))),
+                       max(80, min(180, col[2] + int(dvar * 0.5))))
+
+            # tundra / ice speckles
+            if kind in ("tundra", "ice") and n4[y][x] > 0.7:
+                col = lerp_color(col, (236, 240, 244), 0.35)
+
+            # beaches
+            if coast[y][x] and abs(lat) < 58 and e < 0.35:
+                sand = (228, 210, 160) if abs(lat) < 40 else (200, 198, 180)
+                col = lerp_color(col, sand, 0.55)
+
+            # rivers
+            if river[y][x]:
+                col = lerp_color(col, (55, 110, 150), 0.72)
+
+            # slope lighting (hillshade)
             hx0 = height[y][x - 1] if x > 0 else height[y][x]
             hx1 = height[y][x + 1] if x < GW - 1 else height[y][x]
             hy0 = height[y - 1][x] if y > 0 else height[y][x]
             hy1 = height[y + 1][x] if y < GH - 1 else height[y][x]
-            light = max(-0.4, min(0.4, ((hx1 - hx0) + (hy1 - hy0)) * 2.2))
-            col = lerp_color(col, (255, 255, 255), light * 0.6) if light > 0 else lerp_color(col, (0, 0, 0), -light)
+            light = max(-0.45, min(0.45, ((hx1 - hx0) + (hy1 - hy0)) * 2.6))
+            if light > 0:
+                col = lerp_color(col, (255, 255, 255), light * 0.55)
+            else:
+                col = lerp_color(col, (0, 0, 0), -light * 0.9)
+
+            # micro pixel noise so tiles aren't flat blobs
+            micro = int((n5[y][x] - 0.5) * 10)
+            col = tuple(max(0, min(255, c + micro)) for c in col)
             colors[y][x] = col
     return colors
 
@@ -548,8 +752,11 @@ def generate_map():
                 for y in range(GH)]
     else:
         raw = mountain_map(land)
-        n2, n3 = value_noise(14), value_noise(7)
-        elev = [[raw[y][x] * (0.55 + 0.6 * n2[y][x] + 0.3 * n3[y][x]) for x in range(GW)] for y in range(GH)]
+        n2, n3, n4 = value_noise(14), value_noise(7), value_noise(4)
+        # more multi-scale elevation so hills/ridges aren't flat blobs
+        elev = [[min(1.0, raw[y][x] * (0.50 + 0.55 * n2[y][x] + 0.28 * n3[y][x] + 0.12 * n4[y][x])
+                     + 0.08 * n3[y][x] * n4[y][x])
+                 if land[y][x] else 0.0 for x in range(GW)] for y in range(GH)]
     colors = None if satellite else terrain_colors(land, elev, coast)
     n1 = value_noise(40)
     rough = [[min(1.6, elev[y][x] * 1.5 + 0.2 * n1[y][x]) if land[y][x] else 0.0 for x in range(GW)]
@@ -819,12 +1026,26 @@ class Game:
         self.land_total = sum(row.count(True) for row in self.land)
         self.coast_tiles = [(x, y) for y in range(GH) for x in range(GW) if self.coast[y][x]]
         self.owner = [[-1] * GW for _ in range(GH)]
-        names = random.sample(BOT_NAMES, NUM_BOTS)
-        self.players = [Player(0, "You", PLAYER_COLORS[0], False)]
+        # Build a pool of bot names large enough for the selected count
+        pool = list(BOT_NAMES)
+        while len(pool) < NUM_BOTS:
+            pool.append(f"Nation {len(pool) + 1}")
+        names = random.sample(pool, NUM_BOTS) if NUM_BOTS else []
+        self.players = [Player(0, PLAYER_NAME, PLAYER_COLORS[0], False)]
         for i in range(NUM_BOTS):
-            self.players.append(Player(i + 1, names[i], PLAYER_COLORS[i + 1], True))
-        for j in range(NUM_TRIBES):
-            t = Player(NUM_BOTS + 1 + j, TRIBE_NAMES[j], TRIBE_COLORS[j], True)
+            color = PLAYER_COLORS[(i + 1) % len(PLAYER_COLORS)]
+            # slight hue shift so many bots don't look identical
+            color = (
+                max(20, min(255, color[0] + ((i * 37) % 50) - 25)),
+                max(20, min(255, color[1] + ((i * 53) % 50) - 25)),
+                max(20, min(255, color[2] + ((i * 29) % 50) - 25)),
+            )
+            self.players.append(Player(i + 1, names[i], color, True))
+        tribe_n = max(0, min(NUM_TRIBES, 50))
+        for j in range(tribe_n):
+            name = TRIBE_NAMES[j] if j < len(TRIBE_NAMES) else f"Tribe {j + 1}"
+            color = TRIBE_COLORS[j % len(TRIBE_COLORS)]
+            t = Player(NUM_BOTS + 1 + j, name, color, True)
             t.tribe = True
             self.players.append(t)
         self.buildings, self.attacks = [], []
@@ -889,17 +1110,30 @@ class Game:
                 if 0 <= nx < GW and 0 <= ny < GH and dist[ny][nx] < 0:
                     dist[ny][nx] = dist[y][x] + 1
                     q.append((nx, ny))
+        # soft noise for water surface detail
+        wn = value_noise(11)
+        wn2 = value_noise(4)
         for y in range(GH):
             for x in range(GW):
                 if self.land[y][x]:
                     self.base.set_at((x, y), self.colors[y][x])
                 elif self.wsizes[self.wbody[y][x]] < 6000:
-                    self.base.set_at((x, y), LAKE)
+                    # inland lakes — slightly varied teal
+                    v = int((wn[y][x] - 0.5) * 14)
+                    lake = (max(40, LAKE[0] + v), max(70, LAKE[1] + v), max(110, LAKE[2] + v // 2))
+                    self.base.set_at((x, y), lake)
                 elif dist[y][x] == 1:
                     self.base.set_at((x, y), COAST)
+                elif dist[y][x] == 2:
+                    # shallow shelf
+                    self.base.set_at((x, y), lerp_color(COAST, WATER, 0.55))
                 else:
-                    t = min(1.0, (dist[y][x] - 1) / 24)
-                    self.base.set_at((x, y), lerp_color(WATER, WATER_DEEP, t))
+                    t = min(1.0, (dist[y][x] - 1) / 28)
+                    col = lerp_color(WATER, WATER_DEEP, t)
+                    # wave / depth mottling
+                    wiggle = (wn[y][x] - 0.5) * 16 + (wn2[y][x] - 0.5) * 8
+                    col = tuple(max(8, min(255, int(c + wiggle * (0.4 + 0.6 * t)))) for c in col)
+                    self.base.set_at((x, y), col)
 
     def update_tile(self, x, y):
         if not self.land[y][x]:
@@ -961,11 +1195,13 @@ class Game:
 
     def spawn_bots(self):
         spots = []
+        # Min distance between spawn points (tiles). Lower = nations can start closer.
+        # Was 266 / 90 — now much tighter so dense starts are allowed.
         for p in self.players[1:]:
-            big = 90 if p.tribe else 266
+            big = 36 if p.tribe else 70
             for tries in range(4000):
                 x, y = random.randrange(GW), random.randrange(GH)
-                need = big if tries < 1500 else big * 0.6 if tries < 3000 else big * 0.3
+                need = big if tries < 1500 else big * 0.55 if tries < 3000 else big * 0.25
                 if (self.land[y][x] and self.comp_size[y][x] >= (750 if p.tribe else 4500)
                         and self.rough[y][x] < 0.6 and all(math.dist((x, y), s) >= need for s in spots)):
                     spots.append((x, y))
@@ -979,10 +1215,13 @@ class Game:
             return "Pick a land tile"
         if self.comp_size[y][x] < 750:
             return "That island is too small - pick a bigger landmass"
-        for yy in range(y - 40, y + 41):
-            for xx in range(x - 40, x + 41):
+        # Allow spawning near others (was 40-tile exclusion; now 12)
+        near_r = 12
+        for yy in range(y - near_r, y + near_r + 1):
+            for xx in range(x - near_r, x + near_r + 1):
                 if 0 <= xx < GW and 0 <= yy < GH and self.owner[yy][xx] >= 0:
-                    return "Too close to another nation"
+                    if (xx - x) ** 2 + (yy - y) ** 2 <= near_r * near_r:
+                        return "Too close to another nation"
         self.spawn_at(0, x, y)
         self.phase = "play"
         self.msg("You founded your nation. Expand!", (120, 220, 255))
@@ -1175,6 +1414,26 @@ class Game:
                 a.front = None
                 return
         self.attacks.append(Attack(pid, target, amount))
+
+    def player_attack_troops(self, pid=0):
+        """Total troops currently committed to attacks by this player."""
+        return sum(a.troops for a in self.attacks if a.attacker == pid and a.troops > 0)
+
+    def retract_attacks(self, pid=0):
+        """Stop all of this player's land attacks and return remaining troops."""
+        returned = 0.0
+        keep = []
+        for a in self.attacks:
+            if a.attacker == pid:
+                returned += a.troops
+            else:
+                keep.append(a)
+        self.attacks = keep
+        if returned > 0:
+            self.players[pid].troops += returned
+            if pid == 0:
+                self.msg(f"Retracted attack — {fmt(returned)} troops returned", (180, 220, 255))
+        return returned
 
     def send_attack(self, pid, target, ratio):
         p = self.players[pid]
@@ -1822,7 +2081,8 @@ class Game:
     def can_build(self, pid, kind, x, y):
         if not (0 <= x < GW and 0 <= y < GH) or self.owner[y][x] != pid:
             return "Build on your own land"
-        if self.players[pid].gold < COST[kind]:
+        cost = 0 if (pid == 0 and (INSTANT_BUILD or INFINITE_GOLD)) else COST[kind]
+        if self.players[pid].gold < cost:
             return f"Not enough gold (need {fmt(COST[kind])})"
         if kind == "port" and not (self.coast[y][x] and self.water_around(x, y)):
             return "Ports must be on the coast"
@@ -1835,7 +2095,8 @@ class Game:
         err = self.can_build(pid, kind, x, y)
         if err:
             return err
-        self.players[pid].gold -= COST[kind]
+        cost = 0 if (pid == 0 and (INSTANT_BUILD or INFINITE_GOLD)) else COST[kind]
+        self.players[pid].gold -= cost
         self.buildings.append(Building(kind, x, y))
         if kind in RAIL_KINDS:
             self.rebuild_rails()
@@ -1867,10 +2128,10 @@ class Game:
             return "Click one of your buildings to upgrade it"
         if b.level >= MAX_LEVEL:
             return f"{LABEL[b.kind]} is already max level {MAX_LEVEL}"
-        cost = self.upgrade_cost(b)
+        cost = 0 if (pid == 0 and (INSTANT_BUILD or INFINITE_GOLD)) else self.upgrade_cost(b)
         p = self.players[pid]
         if p.gold < cost:
-            return f"Upgrade needs {fmt(cost)} gold"
+            return f"Upgrade needs {fmt(self.upgrade_cost(b))} gold"
         p.gold -= cost
         b.level += 1
         if pid == 0:
@@ -1888,11 +2149,12 @@ class Game:
         if ap is None:
             return "Click one of your airports to launch a fighter jet"
         p = self.players[pid]
-        if p.gold < COST["jet"]:
+        cost = 0 if (pid == 0 and (INSTANT_BUILD or INFINITE_GOLD)) else COST["jet"]
+        if p.gold < cost:
             return f"Not enough gold (need {fmt(COST['jet'])})"
         if sum(1 for j in self.jets if j.home is ap) >= JETS_PER_AIRPORT:
             return f"This airport already has {JETS_PER_AIRPORT} jets"
-        p.gold -= COST["jet"]
+        p.gold -= cost
         self.jets.append(Jet(pid, ap))
         if pid == 0:
             self.msg("Fighter jet launched!", (180, 220, 255))
@@ -1972,7 +2234,8 @@ class Game:
         if port is None:
             return "Click one of your ports to launch a warship"
         p = self.players[pid]
-        if p.gold < COST["warship"]:
+        cost = 0 if (pid == 0 and (INSTANT_BUILD or INFINITE_GOLD)) else COST["warship"]
+        if p.gold < cost:
             return f"Not enough gold (need {fmt(COST['warship'])})"
         if sum(1 for w in self.warships if w.home is port) >= WARSHIPS_PER_PORT:
             return f"This port already has {WARSHIPS_PER_PORT} warships"
@@ -1980,7 +2243,7 @@ class Game:
         if not water:
             return "No water next to this port"
         wx, wy = water[0]
-        p.gold -= COST["warship"]
+        p.gold -= cost
         self.warships.append(Warship(pid, port, wx * TS + TS / 2, wy * TS + TS / 2))
         if pid == 0:
             self.msg("Warship launched!", (180, 220, 255))
@@ -2137,7 +2400,7 @@ class Game:
             if d < 7 * TS:
                 w.firing = (tx, ty)
                 if isinstance(t, Warship):
-                    t.hp -= 15 * dt
+                    t.hp -= WARSHIP_DMG_SHIP * dt
                     if t.hp <= 0 and not t.dead:
                         t.dead = True
                         self.effects.append({"kind": "sink", "pos": (t.x, t.y), "t": 0.0, "dur": 1.2})
@@ -2149,7 +2412,7 @@ class Game:
                     if d > 4 * TS:
                         self.steer(w, tx, ty, dt, 0.5)
                 else:
-                    t.hp -= 30 * dt
+                    t.hp -= WARSHIP_DMG_BOAT * dt
                     if t.hp <= 0 and not t.sunk:
                         self.sink_boat(t, w.owner)
                     self.steer(w, tx, ty, dt, 0.7)
@@ -2163,7 +2426,8 @@ class Game:
             return "Target is off the map"
         if self.land[ty][tx] and self.is_ally(pid, self.owner[ty][tx]):
             return "You can't nuke an ally"
-        if p.gold < COST["nuke"]:
+        cost = 0 if (pid == 0 and (INSTANT_BUILD or INFINITE_GOLD)) else COST["nuke"]
+        if p.gold < cost:
             return "Not enough gold"
         silos = [b for b in self.buildings
                  if b.kind == "silo" and self.owner_of(b) == pid and b.cooldown <= 0]
@@ -2171,7 +2435,7 @@ class Game:
             return "Need a ready Missile Silo"
         target_px = (tx * TS, ty * TS)
         silo = min(silos, key=lambda b: math.dist(b.pos, target_px))
-        p.gold -= COST["nuke"]
+        p.gold -= cost
         silo.cooldown = silo.cd_total = SILO_COOLDOWN * 0.85 ** (silo.level - 1)
         self.nukes.append(Nuke(pid, silo.pos, (tx, ty)))
         victim = self.owner[ty][tx]
@@ -2366,12 +2630,17 @@ class Game:
                 continue
             n = len(p.tiles)
             mt = self.max_troops(p)
-            if p.troops < mt:
+            if p.id == 0 and INFINITE_TROOPS:
+                p.troops = max(p.troops, mt)
+            elif p.troops < mt:
                 boost = TRIBE_BOOST if p.tribe else BOT_BOOST if p.is_ai else 1.0
                 p.troops = min(mt, p.troops + (2 + n * GROWTH_PER_TILE) * (1 - p.troops / mt) * boost + 0.3)
             else:
                 p.troops -= (p.troops - mt) * 0.02
-            p.gold += GOLD_BASE + n * GOLD_PER_TILE + self.levels(p.id, "city") * GOLD_PER_CITY
+            if p.id == 0 and INFINITE_GOLD:
+                p.gold = max(p.gold, 50_000_000)
+            else:
+                p.gold += GOLD_BASE + n * GOLD_PER_TILE + self.levels(p.id, "city") * GOLD_PER_CITY
 
         self.attacks = [a for a in self.attacks if self.process_attack(a)]
 
@@ -2525,13 +2794,15 @@ class Game:
     def update(self, dt):
         if self.paused or self.phase != "play":
             return
-        self.acc += dt
+        # Scale both logic ticks and realtime systems by the menu game-speed setting
+        scaled = dt * GAME_SPEED
+        self.acc += scaled
         while self.acc >= TICK:
             self.acc -= TICK
             self.tick()
             if self.phase != "play":
                 break
-        self.update_realtime(dt)
+        self.update_realtime(scaled)
 
 
 # ---------------- Drawing ----------------
@@ -2890,11 +3161,42 @@ class Renderer:
                 print("Could not load", path, exc)
                 self.mips = []
         self.cam = Camera()
-        self.buttons = [pygame.Rect(452 + i * 68, MAP_H + 22, 64, 58) for i in range(len(MODES))]
+        # Bottom HUD layout (matches modern OpenFront-style bar)
+        self.buttons = []
         self.menu = None
         self.menu_rects = []
         self.popup_rects = []
-        self.slider = pygame.Rect(236, MAP_H + 52, 190, 8)
+        self.slider = pygame.Rect(200, MAP_H + 52, 220, 10)
+        # Animated HUD values (smooth lerp toward live stats)
+        self.hud = {
+            "troops": 0.0,
+            "max_troops": 1.0,
+            "gold": 0.0,
+            "growth": 0.0,
+            "ratio": 0.3,
+            "btn_pulse": [0.0] * len(MODES),
+        }
+        self.tip_kind = None
+        self.tip_since = 0
+        self.retract_btn = None  # clickable X to stop attacks
+        self._layout_hud()
+
+    def _layout_hud(self):
+        """Compact centered HUD card floating over the bottom of the map."""
+        n = len(MODES)
+        btn_w, btn_h, gap = 34, 26, 3
+        btns_w = n * btn_w + (n - 1) * gap
+        card_w = max(480, btns_w + 28)
+        card_h = 86
+        card_x = (WIN_W - card_w) // 2
+        card_y = MAP_H - card_h - 14  # float over map near the bottom
+        self.hud_card = pygame.Rect(card_x, card_y, card_w, card_h)
+        start_x = card_x + (card_w - btns_w) // 2
+        self.buttons = [
+            pygame.Rect(start_x + i * (btn_w + gap), card_y + 56, btn_w, btn_h)
+            for i in range(n)
+        ]
+        self.slider = pygame.Rect(card_x + 108, card_y + 36, card_w - 200, 8)
 
     def font(self, size, bold=False):
         key = (size, bold)
@@ -3413,7 +3715,8 @@ class Renderer:
                 pygame.draw.circle(o, (170, 170, 170, int(160 * (1 - k))), (x, y), (4 + 8 * k) * self.unit())
 
         mx, my = mouse
-        in_map = my < MAP_H
+        over_hud = hasattr(self, "hud_card") and self.hud_card.collidepoint(mouse)
+        in_map = my < MAP_H and not over_hud
         if g.mode and in_map and g.phase == "play":
             if g.mode == "nuke":
                 pygame.draw.circle(o, (255, 40, 40, 60), (mx, my), NUKE_RADIUS * TS * z)
@@ -3560,48 +3863,293 @@ class Renderer:
             self.screen.blit(img, (14, y + 2))
             y += img.get_height() + 8
 
+    def _lerp_hud(self, key, target, speed=8.0):
+        cur = self.hud.get(key, target)
+        self.hud[key] = cur + (target - cur) * min(1.0, speed * 0.05)
+        return self.hud[key]
+
+    def _rounded(self, surf, color, rect, radius=10, width=0):
+        # pygame accepts RGB or RGBA; RGBA works on SRCALPHA surfaces
+        pygame.draw.rect(surf, color, rect, width, border_radius=radius)
+
+    def _draw_person_icon(self, surf, x, y, color, scale=1.0):
+        r = max(2, int(3 * scale))
+        pygame.draw.circle(surf, color, (x, y - int(4 * scale)), r)
+        body = pygame.Rect(x - int(4 * scale), y - int(1 * scale), int(8 * scale), int(7 * scale))
+        pygame.draw.ellipse(surf, color, body)
+
+    def _draw_coin_icon(self, surf, x, y, color):
+        pygame.draw.circle(surf, color, (x, y), 7)
+        pygame.draw.circle(surf, (40, 40, 20), (x, y), 7, 1)
+        self.text(surf, "$", (x, y), 10, (40, 30, 10), True, True)
+
+    def _draw_sword_icon(self, surf, x, y, color):
+        # simple crossed stroke as sword
+        pygame.draw.line(surf, color, (x - 6, y + 5), (x + 6, y - 5), 2)
+        pygame.draw.line(surf, color, (x - 3, y - 5), (x + 3, y - 2), 2)
+        pygame.draw.line(surf, color, (x - 5, y + 2), (x - 2, y + 5), 2)
+
+    def _draw_mode_icon(self, surf, kind, cx, cy, color, active=False):
+        """Minimal geometric icons for build modes."""
+        if kind == "city":
+            pygame.draw.rect(surf, color, (cx - 7, cy - 2, 5, 8))
+            pygame.draw.rect(surf, color, (cx - 1, cy - 6, 5, 12))
+            pygame.draw.rect(surf, color, (cx + 5, cy - 4, 4, 10))
+        elif kind == "defense":
+            pts = [(cx, cy - 8), (cx + 8, cy - 2), (cx + 6, cy + 7), (cx - 6, cy + 7), (cx - 8, cy - 2)]
+            pygame.draw.polygon(surf, color, pts)
+        elif kind == "silo":
+            pygame.draw.rect(surf, color, (cx - 4, cy - 2, 8, 9), border_radius=2)
+            pygame.draw.polygon(surf, color, [(cx - 5, cy - 2), (cx, cy - 9), (cx + 5, cy - 2)])
+        elif kind == "airdef":
+            pygame.draw.circle(surf, color, (cx, cy), 8, 2)
+            pygame.draw.circle(surf, color, (cx, cy), 3)
+            pygame.draw.line(surf, color, (cx, cy - 8), (cx, cy - 11), 2)
+        elif kind == "port":
+            pygame.draw.rect(surf, color, (cx - 7, cy + 2, 14, 4), border_radius=2)
+            pygame.draw.polygon(surf, color, [(cx - 5, cy + 2), (cx, cy - 7), (cx + 5, cy + 2)])
+        elif kind == "station":
+            pygame.draw.rect(surf, color, (cx - 8, cy - 5, 16, 10), border_radius=2)
+            pygame.draw.circle(surf, color, (cx - 4, cy + 6), 3)
+            pygame.draw.circle(surf, color, (cx + 4, cy + 6), 3)
+        elif kind == "airport":
+            pygame.draw.polygon(surf, color, [(cx - 9, cy + 2), (cx, cy - 7), (cx + 9, cy + 2), (cx, cy + 1)])
+            pygame.draw.line(surf, color, (cx, cy - 7), (cx, cy + 7), 2)
+        elif kind == "warship":
+            pygame.draw.polygon(surf, color, [(cx - 9, cy + 3), (cx - 5, cy - 3), (cx + 6, cy - 3), (cx + 9, cy + 3)])
+            pygame.draw.rect(surf, color, (cx - 1, cy - 7, 3, 5))
+        elif kind == "jet":
+            pygame.draw.polygon(surf, color, [(cx - 8, cy + 3), (cx, cy - 7), (cx + 8, cy + 3)])
+            pygame.draw.line(surf, color, (cx - 6, cy), (cx + 6, cy), 2)
+        elif kind == "upgrade":
+            pygame.draw.polygon(surf, color, [(cx, cy - 7), (cx + 6, cy + 1), (cx + 2, cy + 1),
+                                              (cx + 2, cy + 7), (cx - 2, cy + 7), (cx - 2, cy + 1), (cx - 6, cy + 1)])
+        elif kind == "nuke":
+            pygame.draw.circle(surf, color, (cx, cy), 7, 2)
+            pygame.draw.line(surf, color, (cx - 5, cy), (cx + 5, cy), 2)
+            pygame.draw.line(surf, color, (cx, cy - 5), (cx, cy + 5), 2)
+            pygame.draw.line(surf, color, (cx - 4, cy - 4), (cx + 4, cy + 4), 2)
+            pygame.draw.line(surf, color, (cx - 4, cy + 4), (cx + 4, cy - 4), 2)
+        else:
+            pygame.draw.circle(surf, color, (cx, cy), 5)
+
     def draw_panel(self, g, mouse):
         s = self.screen
-        y0 = MAP_H
-        pygame.draw.rect(s, (24, 27, 36), (0, y0, WIN_W, PANEL_H))
-        pygame.draw.line(s, (70, 80, 100), (0, y0), (WIN_W, y0), 2)
         me = g.players[0]
-        mt = g.max_troops(me)
+        mt = max(1.0, g.max_troops(me))
 
-        self.text(s, f"Troops  {fmt(me.troops)} / {fmt(mt)}", (12, y0 + 6), 14, bold=True)
-        pygame.draw.rect(s, (50, 55, 70), (12, y0 + 25, 200, 9), border_radius=4)
-        pygame.draw.rect(s, me.color, (12, y0 + 25, int(200 * min(1, me.troops / mt)), 9), border_radius=4)
-        self.text(s, f"Gold  {fmt(me.gold)}", (12, y0 + 40), 14, (255, 215, 80), True)
-        self.text(s, f"Rail +{int(g.train_bonus(0) * 100)}% trains", (self.slider.x + 95, y0 + 66), 13, (230, 190, 140))
-        self.text(s, f"Land  {100 * len(me.tiles) / g.land_total:.1f}%  (win at {int(WIN_SHARE * 100)}%)",
-                  (12, y0 + 60), 14, (180, 220, 255))
+        # --- animate HUD values ---
+        n_tiles = len(me.tiles)
+        growth = 0.0
+        if me.troops < mt:
+            growth = ((2 + n_tiles * GROWTH_PER_TILE) * (1 - me.troops / mt) + 0.3) / TICK
+        troops_a = self._lerp_hud("troops", me.troops, 10)
+        mt_a = self._lerp_hud("max_troops", mt, 8)
+        gold_a = self._lerp_hud("gold", me.gold, 10)
+        growth_a = self._lerp_hud("growth", growth, 6)
+        ratio_a = self._lerp_hud("ratio", g.ratio, 14)
 
-        self.text(s, f"Send {int(g.ratio * 100)}% of troops", (self.slider.x, y0 + 26), 14)
-        pygame.draw.rect(s, (60, 66, 84), self.slider, border_radius=4)
-        fill = self.slider.copy()
-        fill.width = int(self.slider.width * g.ratio)
-        pygame.draw.rect(s, (230, 80, 80), fill, border_radius=4)
-        pygame.draw.circle(s, (255, 255, 255), (self.slider.x + fill.width, self.slider.centery), 8)
-        self.text(s, f"Zoom {self.cam.z / MIN_ZOOM:.1f}x", (self.slider.x, y0 + 66), 13, (160, 200, 255))
+        # Keep layout in sync
+        self._layout_hud()
+        card = self.hud_card
 
+        # Draw HUD onto a transparent surface so only the card is visible
+        # (map shows through everywhere else — no black bar)
+        hud = pygame.Surface((card.w, card.h), pygame.SRCALPHA)
+        self._rounded(hud, (28, 34, 48, 220), pygame.Rect(0, 0, card.w, card.h), 12)
+        pygame.draw.rect(hud, (58, 72, 102, 230), pygame.Rect(0, 0, card.w, card.h), 1, border_radius=12)
+
+        # Local origin for drawing inside the HUD surface
+        ox, oy = card.x, card.y
+
+        # ---- Top row: growth | troop bar | gold ----
+        rate_img = self.font(12, True).render(fmt_rate(growth_a), True, (90, 230, 140))
+        growth_w = max(72, 30 + rate_img.get_width())
+        growth_rect = pygame.Rect(8, 7, growth_w, 22)
+        self._rounded(hud, (24, 52, 38, 255), growth_rect, 8)
+        pygame.draw.rect(hud, (46, 130, 85), growth_rect, 1, border_radius=8)
+        self._draw_person_icon(hud, growth_rect.x + 12, growth_rect.centery, (90, 230, 140), 0.85)
+        hud.blit(rate_img, (growth_rect.x + 22, growth_rect.centery - rate_img.get_height() // 2))
+
+        gold_img = self.font(12, True).render(fmt(gold_a), True, (255, 220, 90))
+        gold_w = max(64, 28 + gold_img.get_width())
+        gold_rect = pygame.Rect(card.w - 8 - gold_w, 7, gold_w, 22)
+        self._rounded(hud, (48, 40, 22, 255), gold_rect, 8)
+        pygame.draw.rect(hud, (150, 120, 45), gold_rect, 1, border_radius=8)
+        self._draw_coin_icon(hud, gold_rect.x + 12, gold_rect.centery, (255, 210, 70))
+        hud.blit(gold_img, (gold_rect.x + 24, gold_rect.centery - gold_img.get_height() // 2))
+
+        bar = pygame.Rect(growth_rect.right + 6, 7, gold_rect.x - growth_rect.right - 12, 22)
+        self._rounded(hud, (16, 20, 30, 255), bar, 8)
+        fill_w = int((bar.w - 4) * max(0.0, min(1.0, troops_a / max(1.0, mt_a))))
+        if fill_w > 0:
+            fill_rect = pygame.Rect(bar.x + 2, bar.y + 2, fill_w, bar.h - 4)
+            self._rounded(hud, (55, 130, 235, 255), fill_rect, 6)
+            hi = pygame.Rect(fill_rect.x, fill_rect.y, fill_rect.w, max(2, fill_rect.h // 3))
+            self._rounded(hud, (90, 160, 255, 255), hi, 4)
+        troop_label = f"{fmt(troops_a)} / {fmt(mt_a)}"
+        self.text(hud, troop_label, (bar.centerx, bar.centery), 12, (240, 245, 255), True, True)
+        self._draw_person_icon(hud, bar.right - 14, bar.centery, (180, 195, 220), 0.9)
+
+        # ---- Second row: attack % + slider ----
+        send_amt = int(me.troops * g.ratio)
+        ratio_label = f"{int(g.ratio * 100)}% ({fmt(send_amt)})"
+        self._draw_sword_icon(hud, 16, 40, (200, 210, 230))
+        ratio_img = self.font(11, True).render(ratio_label, True, (220, 228, 245))
+        hud.blit(ratio_img, (26, 40 - ratio_img.get_height() // 2))
+
+        slider_x = 26 + ratio_img.get_width() + 10
+        # Screen-space slider rect (for input)
+        self.slider = pygame.Rect(ox + slider_x, oy + 36, card.w - 12 - slider_x, 8)
+        local_slider = pygame.Rect(slider_x, 36, self.slider.w, 8)
+        self._rounded(hud, (48, 56, 74, 255), local_slider, 4)
+        fill = local_slider.copy()
+        fill.width = max(3, int(local_slider.width * ratio_a))
+        self._rounded(hud, (70, 150, 245, 255), fill, 4)
+        pulse = 1.0 + 0.06 * math.sin(pygame.time.get_ticks() / 280)
+        knob_x = fill.x + fill.width
+        pygame.draw.circle(hud, (255, 255, 255), (knob_x, local_slider.centery), int(6 * pulse))
+        pygame.draw.circle(hud, (70, 150, 245), (knob_x, local_slider.centery), int(3 * pulse))
+
+        # ---- Bottom row: mode buttons ----
+        counts = g.counts(0)
+        hovered_kind = None
+        hovered_rect = None
+        now_ms = pygame.time.get_ticks()
         for i, (kind, rect) in enumerate(zip(MODES, self.buttons)):
             active = g.mode == kind
-            if kind == "upgrade":
-                afford, price = True, "half x Lv"
-            else:
-                afford, price = me.gold >= COST[kind], fmt(COST[kind])
             hover = rect.collidepoint(mouse)
-            bg = (90, 60, 60) if active else (52, 58, 76) if hover else (38, 43, 58)
-            pygame.draw.rect(s, bg, rect, border_radius=8)
-            pygame.draw.rect(s, (230, 80, 80) if active else (80, 90, 115), rect, 2, border_radius=8)
-            col = (255, 255, 255) if afford else (120, 120, 130)
-            self.text(s, f"{MODE_KEYS[i]}. {LABEL[kind]}", (rect.centerx, rect.y + 19), 11, col, True, True)
-            self.text(s, price, (rect.centerx, rect.y + 39), 12,
-                      (255, 215, 80) if afford else (120, 120, 130), False, True)
+            if hover:
+                hovered_kind = kind
+                hovered_rect = rect
+            if active:
+                self.hud["btn_pulse"][i] = min(1.0, self.hud["btn_pulse"][i] + 0.12)
+            else:
+                self.hud["btn_pulse"][i] = max(0.0, self.hud["btn_pulse"][i] - 0.08)
+            pulse_t = self.hud["btn_pulse"][i]
 
-        self.text(s, "Left-click: attack   Right-click land: boat / alliance menu   Ctrl+Wheel: zoom   "
-                     "Right-drag/WASD: move   Wheel: troop %   P: pause   Ctrl+R: restart   "
-                     f"Plane +{fmt(PLANE_REWARD)}  Ship +{fmt(PORT_REWARD)}  Train +{fmt(TRAIN_REWARD)}", (12, y0 + 90), 12, (150, 155, 170))
+            if kind == "upgrade":
+                afford = True
+            else:
+                cost = 0 if (INSTANT_BUILD or INFINITE_GOLD) else COST[kind]
+                afford = me.gold >= cost
+
+            if active:
+                bg, border = (55, 110, 200), (120, 180, 255)
+            elif hover:
+                bg, border = (44, 54, 76), (90, 120, 170)
+            else:
+                bg, border = (34, 42, 58), (58, 70, 94)
+
+            grow = int(1.5 * pulse_t)
+            # local rect relative to HUD surface
+            lr = pygame.Rect(rect.x - ox, rect.y - oy, rect.w, rect.h).inflate(grow, grow)
+            self._rounded(hud, (*bg, 255), lr, 6)
+            pygame.draw.rect(hud, border, lr, 1 + (1 if active else 0), border_radius=6)
+
+            icon_col = (255, 255, 255) if afford else (110, 115, 130)
+            self._draw_mode_icon(hud, kind, lr.centerx, lr.centery - 1, icon_col, active)
+            self.text(hud, MODE_KEYS[i], (lr.x + 3, lr.y - 1), 9, (150, 165, 190), True)
+
+            if kind in BUILDINGS:
+                self.text(hud, str(counts.get(kind, 0)), (lr.right - 4, lr.bottom - 10), 9, (170, 190, 220), True)
+
+        s.blit(hud, card.topleft)
+
+        # ---- Active attack chip + retract (X) ----
+        self.retract_btn = None
+        if g.phase == "play":
+            atk_troops = g.player_attack_troops(0)
+            if atk_troops >= 1:
+                # Prefer a name for the main target if only one front
+                my_atks = [a for a in g.attacks if a.attacker == 0 and a.troops > 0]
+                if len(my_atks) == 1:
+                    t = my_atks[0].target
+                    label = "Wilderness" if t < 0 else g.players[t].name
+                else:
+                    label = f"{len(my_atks)} attacks"
+                chip_txt = f"{fmt(atk_troops)}  {label}"
+                txt_img = self.font(13, True).render(chip_txt, True, (140, 190, 255))
+                chip_w = 18 + 16 + txt_img.get_width() + 10 + 22 + 10
+                chip_h = 28
+                chip = pygame.Rect(card.centerx - chip_w // 2, card.y - chip_h - 6, chip_w, chip_h)
+                self._rounded(s, (32, 40, 58), chip, 10)
+                pygame.draw.rect(s, (70, 100, 150), chip, 1, border_radius=10)
+                # sword-ish mark
+                self._draw_sword_icon(s, chip.x + 14, chip.centery, (120, 180, 255))
+                s.blit(txt_img, (chip.x + 28, chip.centery - txt_img.get_height() // 2))
+                # X button
+                xb = pygame.Rect(chip.right - 26, chip.centery - 9, 18, 18)
+                hover_x = xb.collidepoint(mouse)
+                self._rounded(s, (90, 45, 50) if hover_x else (60, 35, 40), xb, 5)
+                pygame.draw.line(s, (255, 140, 140), (xb.x + 4, xb.y + 4), (xb.right - 4, xb.bottom - 4), 2)
+                pygame.draw.line(s, (255, 140, 140), (xb.right - 4, xb.y + 4), (xb.x + 4, xb.bottom - 4), 2)
+                self.retract_btn = xb
+
+        # ---- Hover tooltip (shows after 50 ms) ----
+        if hovered_kind is None:
+            self.tip_kind = None
+            self.tip_since = 0
+        else:
+            if self.tip_kind != hovered_kind:
+                self.tip_kind = hovered_kind
+                self.tip_since = now_ms
+            if now_ms - self.tip_since >= 50:
+                self._draw_mode_tooltip(s, g, hovered_kind, hovered_rect, counts)
+
+    def _draw_mode_tooltip(self, s, g, kind, btn_rect, counts):
+        """Popup above a build icon: name [count], description, cost."""
+        name = LABEL.get(kind, kind.title())
+        cnt = counts.get(kind, 0) if kind in BUILDINGS else None
+        title = f"{name} [{cnt}]" if cnt is not None else name
+        desc = MODE_DESC.get(kind, "")
+        if kind == "upgrade":
+            cost_txt = "Half of building cost × level"
+            cost_color = (200, 200, 210)
+        else:
+            cost_val = COST.get(kind, 0)
+            if INSTANT_BUILD or INFINITE_GOLD:
+                cost_txt = "Free"
+                cost_color = (120, 220, 140)
+            else:
+                cost_txt = fmt(cost_val)
+                cost_color = (255, 210, 70)
+
+        title_img = self.font(14, True).render(title, True, (240, 245, 255))
+        desc_img = self.font(12, False).render(desc, True, (170, 180, 200)) if desc else None
+        cost_img = self.font(13, True).render(cost_txt, True, cost_color)
+
+        pad_x, pad_y = 14, 10
+        gap = 4
+        inner_w = max(title_img.get_width(), cost_img.get_width())
+        if desc_img:
+            inner_w = max(inner_w, desc_img.get_width())
+        box_w = inner_w + pad_x * 2
+        box_h = pad_y * 2 + title_img.get_height() + gap + cost_img.get_height()
+        if desc_img:
+            box_h += gap + desc_img.get_height()
+
+        # Position above the button, clamped to screen
+        bx = btn_rect.centerx - box_w // 2
+        by = btn_rect.y - box_h - 8
+        bx = max(6, min(WIN_W - box_w - 6, bx))
+        by = max(6, by)
+
+        tip = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        self._rounded(tip, (28, 34, 48, 235), pygame.Rect(0, 0, box_w, box_h), 10)
+        pygame.draw.rect(tip, (70, 90, 120, 240), pygame.Rect(0, 0, box_w, box_h), 1, border_radius=10)
+
+        y = pad_y
+        tip.blit(title_img, (pad_x, y))
+        y += title_img.get_height() + gap
+        if desc_img:
+            tip.blit(desc_img, (pad_x, y))
+            y += desc_img.get_height() + gap
+        # coin-ish gold line
+        pygame.draw.circle(tip, (255, 210, 70), (pad_x + 6, y + cost_img.get_height() // 2), 5)
+        tip.blit(cost_img, (pad_x + 16, y))
+
+        s.blit(tip, (bx, by))
 
     def draw_overlays(self, g):
         s = self.screen
@@ -3633,7 +4181,13 @@ def handle_click(g, r, pos):
     if r.menu:
         r.menu_click(g, pos)
         return False
-    if my >= MAP_H:
+    # Retract attacks (X on the attack chip)
+    if getattr(r, "retract_btn", None) and r.retract_btn.collidepoint(pos):
+        if g.phase == "play":
+            g.retract_attacks(0)
+        return False
+    # HUD floats over the map — capture clicks on the card first
+    if hasattr(r, "hud_card") and r.hud_card.collidepoint(pos):
         for kind, rect in zip(MODES, r.buttons):
             if rect.collidepoint(pos) and g.phase == "play":
                 g.mode = None if g.mode == kind else kind
@@ -3641,7 +4195,7 @@ def handle_click(g, r, pos):
         if r.slider.inflate(20, 24).collidepoint(pos):
             set_ratio(g, r, mx)
             return True
-        return False
+        return False  # click on card chrome, ignore map under it
 
     tx, ty = r.mouse_tile(pos)
     if not (0 <= tx < GW and 0 <= ty < GH):
@@ -3690,7 +4244,7 @@ def set_ratio(g, r, mx):
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
-    pygame.display.set_caption("OpenFront World")
+    pygame.display.set_caption("Beterfront")
     clock = pygame.time.Clock()
     screen.fill((15, 17, 24))
     font = pygame.font.SysFont("arial", 28, bold=True)
@@ -3722,7 +4276,9 @@ def main():
                         g.mode = None
                     elif r.menu:
                         r.menu = None
-                    elif g.phase == "play" and e.pos[1] < MAP_H:
+                    elif g.phase == "play" and e.pos[1] < MAP_H and not (
+                        hasattr(r, "hud_card") and r.hud_card.collidepoint(e.pos)
+                    ):
                         r.open_menu(g, e.pos)
                 right_down = False
             elif e.type == pygame.MOUSEMOTION:
