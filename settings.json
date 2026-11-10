@@ -1,0 +1,20 @@
+{
+    "mode": "singleplayer",
+    "map": "World",
+    "username": "Player",
+    "player_tag": "TAG",
+    "display_name": "[TAG] Player",
+    "difficulty": "Medium",
+    "bots": 100,
+    "tribes": 25,
+    "game_speed": 1.0,
+    "disable_npcs": false,
+    "instant_build": false,
+    "infinite_gold": false,
+    "infinite_troops": false,
+    "music_volume": 70,
+    "sfx_volume": 80,
+    "fullscreen": false,
+    "fps_limit": 60,
+    "theme": "dark"
+}
